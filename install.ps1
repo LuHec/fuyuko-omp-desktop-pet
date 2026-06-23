@@ -1,5 +1,5 @@
 param(
-  [string]$RepoUrl = "https://github.com/YOUR_GITHUB_USER/fuyuko-omp-desktop-pet.git",
+  [string]$RepoUrl = "https://github.com/LuHec/fuyuko-omp-desktop-pet.git",
   [string]$Branch = "main",
   [string]$SourceDir = (Join-Path (Join-Path $env:USERPROFILE ".omp") ".fuyuko-src"),
   [switch]$Update,
@@ -34,10 +34,6 @@ function Update-SourceCache([string]$Dir, [string]$Url, [string]$Branch) {
       Pop-Location
     }
     return $Dir
-  }
-
-  if ($Url -like "*YOUR_GITHUB_USER*") {
-    throw "Please replace the placeholder RepoUrl with your actual GitHub repository URL, or pass -RepoUrl."
   }
 
   Write-Info "Fetching source from $Url (branch $Branch) ..."

@@ -74,7 +74,7 @@ All CSS state motion is vertical-only (`translateY`) to avoid sideways shake/rot
 
 ## Install
 
-1. Clone this repo on the target machine (`git clone https://github.com/YOUR_GITHUB_USER/fuyuko-omp-desktop-pet.git`), or copy this whole folder there.
+1. Clone this repo on the target machine (`git clone https://github.com/LuHec/fuyuko-omp-desktop-pet.git`), or copy this whole folder there.
 2. Close OMP completely.
 3. Open PowerShell in this folder.
 4. If script execution is blocked for this one run:
@@ -88,7 +88,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```powershell
 .\install.ps1
 ```
-> If you are running a downloaded copy of `install.ps1` rather than a git clone, edit the `RepoUrl` default at the top of the script or pass it: ` .\install.ps1 -RepoUrl https://github.com/YOUR_GITHUB_USER/fuyuko-omp-desktop-pet.git`.
+> If you are running a downloaded copy of `install.ps1` rather than a git clone, edit the `RepoUrl` default at the top of the script or pass it: ` .\install.ps1 -RepoUrl https://github.com/LuHec/fuyuko-omp-desktop-pet.git`.
 
 
 The installer copies files to:

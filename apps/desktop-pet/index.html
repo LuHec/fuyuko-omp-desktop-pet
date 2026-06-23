@@ -166,7 +166,7 @@
       idle: { row: 0, frames: 6, ms: 400 },
       "running-right": { row: 1, frames: 8, ms: 180 },
       "running-left": { row: 2, frames: 8, ms: 180 },
-      waving: { row: 3, frames: 4, ms: 300 },
+      waving: { row: 3, frames: 4, ms: 400 },
       jumping: { row: 4, frames: 5, ms: 280 },
       failed: { row: 5, frames: 8, ms: 320 },
       waiting: { row: 6, frames: 6, ms: 380 },
@@ -264,9 +264,8 @@
       }
     });
 
-    pet.addEventListener('click', () => {
       setState('waving');
-      setTimeout(() => setState('idle'), 1200);
+      setTimeout(() => setState('idle'), 1600);
     });
 
     resizeHandle.addEventListener('pointerdown', (event) => {

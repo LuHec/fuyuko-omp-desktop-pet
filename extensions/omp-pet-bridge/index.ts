@@ -140,11 +140,19 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
         }
       }
     }
+    if (!existsSync(ELECTRON_BIN)) {
+      pi.logger.debug(`[pet] electron executable missing: ${ELECTRON_BIN}`);
+      return;
+    }
     pet = spawn(ELECTRON_BIN, [PET_DIR], {
       cwd: PET_DIR,
       detached: false,
       windowsHide: true,
       stdio: "ignore",
+    });
+    pet.on("error", (err) => {
+      pi.logger.debug(`[pet] failed to start electron: ${err.message}`);
+      pet = undefined;
     });
     pet.on("exit", () => {
       pet = undefined;

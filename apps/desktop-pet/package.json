@@ -1,0 +1,19 @@
+{
+  "name": "omp-desktop-pet",
+  "version": "0.1.0",
+  "description": "Desktop sprite pet demo",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^42.4.1",
+    "electron-builder": "^26.0.12"
+  },
+  "pet": {
+    "width": 230,
+    "height": 250
+  }
+}

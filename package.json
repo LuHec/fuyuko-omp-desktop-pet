@@ -1,0 +1,14 @@
+{
+  "name": "fuyuko-omp-desktop-pet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fuyuko desktop pet for Oh My Pi (OMP). Source repository + installer.",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "pet:install": "powershell -NoProfile -ExecutionPolicy Bypass -File ./install.ps1",
+    "pet:update": "powershell -NoProfile -ExecutionPolicy Bypass -File ./install.ps1 -Update",
+    "start:pet": "electron apps/desktop-pet"
+  }
+}

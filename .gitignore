@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+tmp-check/
+out/
+*.tgz
+
+# logs
+logs/
+*.log
+
+# dotenv
+.env
+.env.*
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# runtime / generated (should never be committed)
+pet.pid
+pet-command.json
+pet-command.tmp.json

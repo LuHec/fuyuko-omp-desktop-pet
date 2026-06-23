@@ -1,0 +1,65 @@
+Fuyuko Pet 11-Row Extended Spritesheet Row Map
+
+Use this high-res replacement image:
+C:\Users\ChengYF\Documents\Codex\2026-06-22\new-chat\outputs\fuyuko-pet\fuyuko-11row-highres.png
+
+Same high-res image, source-atlas alias:
+C:\Users\ChengYF\Documents\Codex\2026-06-22\new-chat\outputs\fuyuko-pet\source-atlas\fuyuko-source-extended-11row-atlas.png
+
+Runtime/standard 192x208 WebP alias:
+C:\Users\ChengYF\Documents\Codex\2026-06-22\new-chat\outputs\fuyuko-pet\extended-spritesheet-11row.webp
+
+Geometry:
+- High-res atlas: 4608 x 6864
+- High-res cell: 576 x 624
+- Standard atlas: 1536 x 2288
+- Standard cell: 192 x 208
+- Columns: 8
+- Rows: 11
+
+Important:
+Current Codex pet runtime expects the original first 9 rows unless the consuming code is changed to read 11 rows. Rows 10 and 11 are extra action rows.
+
+Row 01 / zero-based 0 / idle
+Used frames: 6
+Action: 待机。轻微呼吸、眨眼、小幅身体起伏。
+
+Row 02 / zero-based 1 / running-right
+Used frames: 8
+Action: 向右移动状态。当前设计是被拎住向右移动，不是跑步。
+
+Row 03 / zero-based 2 / running-left
+Used frames: 8
+Action: 向左移动状态。当前设计是被拎住向左移动，不是跑步。
+
+Row 04 / zero-based 3 / waving
+Used frames: 4
+Action: 挥手。用于打招呼或轻量互动。
+
+Row 05 / zero-based 4 / jumping
+Used frames: 5
+Action: 跳跃。通过身体位置变化表达弹跳。
+
+Row 06 / zero-based 5 / failed
+Used frames: 8
+Action: 失败、沮丧、出错后的反应。
+
+Row 07 / zero-based 6 / waiting
+Used frames: 6
+Action: 等待用户输入、等待批准、期待回应。
+
+Row 08 / zero-based 7 / running
+Used frames: 6
+Action: Codex 正在处理任务、工作中。不是字面跑步。
+
+Row 09 / zero-based 8 / review
+Used frames: 6
+Action: 审阅、专注查看、检查内容。
+
+Row 10 / zero-based 9 / sos-dance
+Used frames: 8
+Action: SOS 标志舞。包含手贴额头/敬礼式动作和脸侧 OK 圈指动作。
+
+Row 11 / zero-based 10 / contempt-look
+Used frames: 8
+Action: 鄙夷、嫌弃看人。眉毛藏在刘海下，用眼睑、眼神和开口嘴型表达压迫感。

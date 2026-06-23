@@ -1,0 +1,24 @@
+{
+  "package": "fuyuko-omp-desktop-pet",
+  "created": "2026-06-23",
+  "install_script": "install.ps1",
+  "extension_target": "%USERPROFILE%\\.omp\\agent\\extensions\\omp-pet-bridge\\index.ts",
+  "pet_target": "%USERPROFILE%\\.omp\\omp-desktop-pet",
+  "atlas": {
+    "path": "apps/desktop-pet/assets/fuyuko/spritesheet.png",
+    "size": [
+      4608,
+      6864
+    ],
+    "columns": 8,
+    "rows": 11,
+    "source_cell": [
+      576,
+      624
+    ],
+    "runtime_cell": [
+      192,
+      208
+    ]
+  }
+}

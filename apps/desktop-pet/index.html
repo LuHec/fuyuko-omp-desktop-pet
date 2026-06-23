@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-app-region: drag;
+    }
+    #stage {
+      position: relative;
+      width: 192px;
+      height: 230px;
+      transform: scale(var(--pet-scale, 1));
+      transform-origin: center center;
+    }
+    #pet {
+      position: relative;
+      width: 192px;
+      height: 208px;
+      transform-origin: 50% 100%;
+      animation: bob 1.6s ease-in-out infinite;
+      cursor: grab;
+    }
+    #pet:active { cursor: grabbing; }
+    #sprite {
+      width: 192px;
+      height: 208px;
+      background-image: url("./assets/fuyuko/spritesheet.png");
+      background-repeat: no-repeat;
+      background-size: 1536px 2288px;
+      image-rendering: auto;
+      pointer-events: none;
+    }
+    @keyframes bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
+    }
+    #pet.running, #pet.working { animation: run-bob 0.7s ease-in-out infinite; }
+    @keyframes run-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-8px); }
+    }
+    #pet.waiting { animation: wait-bob 1.2s ease-in-out infinite; }
+    @keyframes wait-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-3px); }
+    }
+    #pet.failed { animation: failed-bob 0.75s ease-in-out infinite; }
+    @keyframes failed-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(4px); }
+    }
+    #pet.review, #pet.thinking { animation: review-bob 1.8s ease-in-out infinite; }
+    @keyframes review-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-4px); }
+    }
+    #pet.waving { animation: wave-bob 0.55s ease-in-out infinite; }
+    @keyframes wave-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-5px); }
+    }
+    #state-label {
+      position: absolute;
+      left: 50%;
+      bottom: -14px;
+      transform: translateX(-50%);
+      font: 11px "Segoe UI", sans-serif;
+      color: #fff;
+      text-shadow: 0 1px 2px #000;
+      background: rgba(0, 0, 0, 0.42);
+      padding: 2px 8px;
+      border-radius: 10px;
+      pointer-events: none;
+      opacity: 0.68;
+      white-space: nowrap;
+    }
+    #resize-handle {
+      position: absolute;
+      right: -2px;
+      bottom: 0;
+      width: 18px;
+      height: 18px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.45);
+      color: rgba(255, 255, 255, 0.88);
+      font: 13px/18px "Segoe UI Symbol", "Segoe UI", sans-serif;
+      text-align: center;
+      cursor: nwse-resize;
+      -webkit-app-region: no-drag;
+      z-index: 10;
+    }
+    #resize-handle:hover {
+      background: rgba(0, 0, 0, 0.62);
+    }
+
+    /* --- Debug bubble (top-right of pet) --- */
+    #debug-panel {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      min-width: 120px;
+      max-width: 180px;
+      background: rgba(12, 12, 20, 0.88);
+      border: 1px solid rgba(79, 195, 247, 0.25);
+      border-radius: 8px;
+      padding: 3px 6px 4px;
+      font: 9px "Cascadia Code", "Consolas", monospace;
+      color: #ccc;
+      z-index: 30;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+    }
+    #debug-panel.hidden { display: none; }
+    #debug-panel .dbg-hd {
+      font-size: 8px;
+      letter-spacing: 0.5px;
+      color: #4fc3f7;
+      margin-bottom: 2px;
+      padding-bottom: 2px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    #debug-panel .dbg-ev {
+      line-height: 1.45;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #debug-panel .dbg-t { color: #555; }
+    #debug-panel .dbg-e { color: #4fc3f7; }
+    #debug-panel .dbg-s { color: #81c784; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="pet" title="Fuyuko">
+      <div id="sprite" aria-label="Fuyuko desktop pet"></div>
+      <div id="state-label">idle</div>
+    </div>
+    <div id="resize-handle" title="拖拽缩放">↘</div>
+    <div id="debug-panel" class="hidden">
+      <div class="dbg-hd">DEBUG</div>
+      <div id="debug-events"></div>
+    </div>
+  </div>
+
+  <script>
+    const electronRequire = globalThis.require;
+    const ipcRenderer = electronRequire ? electronRequire('electron').ipcRenderer : null;
+
+    const CELL_W = 192;
+    const CELL_H = 208;
+
+    const states = {
+      idle: { row: 0, frames: 6, ms: 400 },
+      "running-right": { row: 1, frames: 8, ms: 180 },
+      "running-left": { row: 2, frames: 8, ms: 180 },
+      waving: { row: 3, frames: 4, ms: 300 },
+      jumping: { row: 4, frames: 5, ms: 280 },
+      failed: { row: 5, frames: 8, ms: 320 },
+      waiting: { row: 6, frames: 6, ms: 380 },
+      running: { row: 7, frames: 6, ms: 220 },
+      review: { row: 8, frames: 6, ms: 350 },
+      "sos-dance": { row: 9, frames: 8, ms: 180 },
+      "contempt-look": { row: 10, frames: 8, ms: 260 },
+      thinking: { row: 8, frames: 6, ms: 350 },
+      working: { row: 7, frames: 6, ms: 220 },
+    };
+
+    const stateVariants = {
+      working: ["running", "sos-dance"],
+      thinking: ["review", "contempt-look"],
+    };
+
+    const stage = document.getElementById('stage');
+    const pet = document.getElementById('pet');
+    const sprite = document.getElementById('sprite');
+    const label = document.getElementById('state-label');
+    const resizeHandle = document.getElementById('resize-handle');
+    const debugPanel = document.getElementById('debug-panel');
+    const debugEvents = document.getElementById('debug-events');
+    let currentScale = 1;
+    let resizeDrag = undefined;
+
+    let currentState = 'idle';
+    let currentSpriteState = 'idle';
+    let frame = 0;
+    let timer = undefined;
+    let debugVisible = false;
+    const MAX_DEBUG = 8;
+
+    function pickSpriteState(state) {
+      const variants = stateVariants[state];
+      if (!variants) return state;
+      return variants[Math.floor(Math.random() * variants.length)];
+    }
+
+    function paint() {
+      const spec = states[currentSpriteState] || states[currentState] || states.idle;
+      sprite.style.backgroundPosition = `-${frame * CELL_W}px -${spec.row * CELL_H}px`;
+      label.textContent = currentState;
+    }
+
+    function schedule() {
+      clearInterval(timer);
+      const spec = states[currentSpriteState] || states[currentState] || states.idle;
+      timer = setInterval(() => {
+        frame = (frame + 1) % spec.frames;
+        paint();
+      }, spec.ms);
+    }
+
+    function setState(state) {
+      const next = states[state] ? state : 'idle';
+      if (next === currentState) return;
+      currentState = next;
+      currentSpriteState = pickSpriteState(next);
+      frame = 0;
+      pet.className = next;
+      paint();
+      schedule();
+    }
+
+    ipcRenderer?.on('omp-state', (_event, state) => setState(state));
+    ipcRenderer?.on('omp-size', (_event, scale) => {
+      const numeric = Number(scale);
+      if (!Number.isFinite(numeric)) return;
+      currentScale = Math.min(3, Math.max(0.35, numeric));
+      stage.style.setProperty('--pet-scale', String(currentScale));
+    });
+
+    // --- Debug bubble ---
+    ipcRenderer?.on('omp-debug-mode', (_event, enabled) => {
+      debugVisible = !!enabled;
+      debugPanel.classList.toggle('hidden', !enabled);
+    });
+
+    ipcRenderer?.on('omp-debug', (_event, entry) => {
+      if (!debugVisible) return;
+      const div = document.createElement('div');
+      div.className = 'dbg-ev';
+      const t = new Date(entry.time);
+      const ts = String(t.getHours()).padStart(2,'0') + ':' +
+                 String(t.getMinutes()).padStart(2,'0') + ':' +
+                 String(t.getSeconds()).padStart(2,'0');
+      div.innerHTML =
+        '<span class="dbg-t">' + ts + '</span> ' +
+        '<span class="dbg-e">' + entry.event + '</span> ' +
+        '<span class="dbg-s">' + entry.state + '</span>';
+      debugEvents.insertBefore(div, debugEvents.firstChild);
+      while (debugEvents.children.length > MAX_DEBUG) {
+        debugEvents.removeChild(debugEvents.lastChild);
+      }
+    });
+
+    pet.addEventListener('click', () => {
+      setState('waving');
+      setTimeout(() => setState('idle'), 1200);
+    });
+
+    resizeHandle.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      resizeDrag = {
+        x: event.screenX,
+        y: event.screenY,
+        scale: currentScale,
+      };
+      resizeHandle.setPointerCapture(event.pointerId);
+    });
+
+    resizeHandle.addEventListener('pointermove', (event) => {
+      if (!resizeDrag) return;
+      event.preventDefault();
+      const dx = event.screenX - resizeDrag.x;
+      const dy = event.screenY - resizeDrag.y;
+      const scaleX = dx / 230;
+      const scaleY = dy / 250;
+      const delta = Math.abs(scaleX) > Math.abs(scaleY) ? scaleX : scaleY;
+      const nextScale = Math.min(3, Math.max(0.35, resizeDrag.scale + delta));
+      ipcRenderer?.send('pet-resize', nextScale);
+    });
+
+    resizeHandle.addEventListener('pointerup', (event) => {
+      resizeDrag = undefined;
+      try {
+        resizeHandle.releasePointerCapture(event.pointerId);
+      } catch {}
+    });
+
+    resizeHandle.addEventListener('pointercancel', () => {
+      resizeDrag = undefined;
+    });
+
+    paint();
+    schedule();
+  </script>
+</body>
+</html>

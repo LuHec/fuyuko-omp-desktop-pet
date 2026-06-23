@@ -42,6 +42,20 @@
       image-rendering: auto;
       pointer-events: none;
     }
+    #hover-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 192px;
+      height: 208px;
+      background-image: url("./assets/fuyuko/spritesheet.png");
+      background-repeat: no-repeat;
+      background-size: 1536px 2288px;
+      image-rendering: auto;
+      pointer-events: none;
+      display: none;
+      z-index: 2;
+    }
     @keyframes bob {
       0%, 100% { transform: translateY(0); }
       50% { transform: translateY(-6px); }
@@ -146,6 +160,7 @@
   <div id="stage">
     <div id="pet" title="Fuyuko">
       <div id="sprite" aria-label="Fuyuko desktop pet"></div>
+      <div id="hover-layer"></div>
       <div id="state-label">idle</div>
     </div>
     <div id="resize-handle" title="拖拽缩放">↘</div>
@@ -195,11 +210,8 @@
 
     let currentState = 'idle';
     let currentSpriteState = 'idle';
-    let ompState = 'idle';            // 来自 OMP 的真实状态
     let frame = 0;
     let timer = undefined;
-    let hoverTimer = undefined;
-    let isHovering = false;
     let debugVisible = false;
     const MAX_DEBUG = 8;
 
@@ -235,10 +247,8 @@
       schedule();
     }
 
-    ipcRenderer?.on('omp-state', (_event, state) => {
-      ompState = state;
-      if (!isHovering) setState(state);
-    });
+    ipcRenderer?.on('omp-state', (_event, state) => setState(state));
+
 
     ipcRenderer?.on('omp-size', (_event, scale) => {
       const numeric = Number(scale);
@@ -271,31 +281,65 @@
       }
     });
 
-    function playHoverCycle() {
-      const state = Math.random() < 0.5 ? 'waving' : 'jumping';
-      const duration = state === 'waving' ? 1600 : 1400;
-      setState(state);
-      hoverTimer = setTimeout(() => {
-        if (isHovering) playHoverCycle();
-        else setState(ompState);
-      }, duration);
+    // --- Hover/click overlay: purely cosmetic. Never touches the extension state
+    //     machine, so important states (failed/working/...) keep showing underneath. ---
+    const hoverLayer = document.getElementById('hover-layer');
+    let overlayTimer = undefined;
+    let overlayEndTimer = undefined;
+    let overlayState = 'waving';
+    let overlayFrame = 0;
+    let overlayLoop = false;
+    let pointerInside = false;
+
+    function paintOverlay() {
+      const spec = states[overlayState];
+      hoverLayer.style.backgroundPosition = `-${overlayFrame * CELL_W}px -${spec.row * CELL_H}px`;
     }
+
+    function stepOverlay() {
+      overlayFrame++;
+      const spec = states[overlayState];
+      if (overlayFrame >= spec.frames) {
+        overlayFrame = 0;
+        if (overlayLoop) overlayState = Math.random() < 0.5 ? 'waving' : 'jumping';
+      }
+      paintOverlay();
+      overlayTimer = setTimeout(stepOverlay, states[overlayState].ms);
+    }
+
+    function stopOverlay(resumeHover = false) {
+      clearTimeout(overlayTimer);
+      clearTimeout(overlayEndTimer);
+      overlayTimer = undefined;
+      overlayEndTimer = undefined;
+      hoverLayer.style.display = 'none';
+      if (resumeHover && pointerInside) {
+        startOverlay(Math.random() < 0.5 ? 'waving' : 'jumping', { loop: true });
+      }
+    }
+
+    function startOverlay(state, { loop = false, duration = 0 } = {}) {
+      clearTimeout(overlayTimer);
+      clearTimeout(overlayEndTimer);
+      overlayState = state;
+      overlayFrame = 0;
+      overlayLoop = loop;
+      hoverLayer.style.display = 'block';
+      paintOverlay();
+      overlayTimer = setTimeout(stepOverlay, states[overlayState].ms);
+      if (duration) overlayEndTimer = setTimeout(() => stopOverlay(true), duration);
+    }
+
     pet.addEventListener('mouseenter', () => {
-      if (isHovering) return;
-      isHovering = true;
-      clearTimeout(hoverTimer);
-      playHoverCycle();
+      pointerInside = true;
+      startOverlay(Math.random() < 0.5 ? 'waving' : 'jumping', { loop: true });
     });
     pet.addEventListener('mouseleave', () => {
-      isHovering = false;
-      clearTimeout(hoverTimer);
-      setState(ompState);
+      pointerInside = false;
+      stopOverlay();
     });
     pet.addEventListener('click', () => {
-      isHovering = false;
-      clearTimeout(hoverTimer);
-      setState('waving');
-      hoverTimer = setTimeout(() => setState(ompState), 1600);
+      startOverlay('waving', { duration: 1600 });
     });
 
     resizeHandle.addEventListener('pointerdown', (event) => {

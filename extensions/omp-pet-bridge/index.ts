@@ -1,14 +1,29 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { connect, type Socket } from "node:net";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// ---------------------------------------------------------------------------
+// omp-pet-bridge — thin per-session pipe client.
+//
+// The pet PROCESS is the single in-memory state authority (it aggregates every
+// connected session, debounces, and renders). This extension only tracks this
+// session's own signals (agentActive / providerWaiting / streaming / toolCount)
+// and forwards hook-derived deltas to the pet over a local named pipe. It owns
+// no state machine and no debounce; multiple sessions are coherent because the
+// pet aggregates. Connection drop = this session's contribution is dropped.
+// ---------------------------------------------------------------------------
 
 const PET_DIR = join(homedir(), ".omp", "omp-desktop-pet");
 const PID_FILE = join(PET_DIR, "pet.pid");
 const CONTROL_FILE = join(PET_DIR, "pet-control.json");
-const COMMAND_FILE = join(PET_DIR, "pet-command.json");
-const COMMAND_TMP_FILE = join(PET_DIR, "pet-command.tmp.json");
+// Must match the path derived in main.js (both resolve PET_DIR identically).
+const PIPE_PATH =
+  process.platform === "win32"
+    ? "\\\\.\\pipe\\fuyuko-omp-pet"
+    : join(PET_DIR, "pet.sock");
 const ELECTRON_BIN =
   process.platform === "win32"
     ? join(PET_DIR, "node_modules", "electron", "dist", "electron.exe")
@@ -37,63 +52,141 @@ function isPetState(state: string): state is PetState {
 
 type TimerHandle = NodeJS.Timeout;
 
-const MIN_VISUAL_MS: Record<PetState, number> = {
-  idle: 200,
-  waiting: 500,
-  thinking: 500,
-  working: 500,
-  failed: 900,
-  waving: 600,
-};
-
-const TRANSIENT_MS: Partial<Record<PetState, number>> = {
-  failed: 3500,
-  waving: 900,
-};
-
-interface EventAction {
+interface SignalPatch {
   agentActive?: boolean;
   providerWaiting?: boolean;
   streaming?: boolean;
   toolDelta?: number;
-  transient?: PetState;
+  transient?: "failed" | "waving";
   clearTransient?: boolean;
 }
 
 export default function ompPetBridge(pi: ExtensionAPI): void {
   let pet: ChildProcess | undefined;
+  let sock: Socket | undefined;
+  let connected = false;
+  let reconnectTimer: TimerHandle | undefined;
+  let debugMode = false;
+  // Cached so the agent hot path (every hook) never touches the disk.
+  let enabledCached = false;
+  let shutdown = false;
 
-  // Semantic model:
-  //   idle     = whole user request finished; waiting for user input
-  //   waiting  = request is in flight; waiting for LLM stream / next LLM round
-  //   thinking = LLM is streaming thinking/text/tool-call content
-  //   working  = an actual tool is executing
-  //   failed   = transient after tool failure
-  //   waving   = transient for pet start/leave
+  // This session's own signals — tracked only to send deltas and to resync
+  // after a reconnect. No timing, no visual logic lives here.
   let agentActive = false;
   let providerWaiting = false;
   let streaming = false;
-  let activeToolCount = 0;
-  let transient: { state: PetState; timer: TimerHandle } | undefined;
-  let testOverride: { state: PetState; timer: TimerHandle } | undefined;
-
-  let visualState: PetState = "idle";
-  let visualUntil = 0;
-  let pendingState: PetState | undefined;
-  let debounceTimer: TimerHandle | undefined;
-
-  let debugMode = false;
-  let commandSeq = 0;
-
+  let toolCount = 0;
 
   function send(msg: Record<string, unknown>): void {
-    const payload = { ...msg, sentAt: Date.now() };
+    if (!connected || !sock) return;
     try {
-      writeFileSync(COMMAND_TMP_FILE, JSON.stringify(payload), "utf8");
-      renameSync(COMMAND_TMP_FILE, COMMAND_FILE);
+      sock.write(JSON.stringify(msg) + "\n");
     } catch {
-      // file IPC unavailable
+      // connection lost; 'close' will trigger reconnect
     }
+  }
+
+  // Forward a hook-derived change. Computes the delta vs. the tracked signals
+  // and only sends what actually moved. transient/clearTransient are forwarded
+  // as event signals; the pet owns their timers.
+  function pushState(event: string, patch: SignalPatch): void {
+    if (!enabledCached) return;
+    const msg: Record<string, unknown> = { type: "state" };
+    let any = false;
+    if (patch.agentActive !== undefined && patch.agentActive !== agentActive) {
+      agentActive = patch.agentActive;
+      msg.agentActive = agentActive;
+      any = true;
+    }
+    if (patch.providerWaiting !== undefined && patch.providerWaiting !== providerWaiting) {
+      providerWaiting = patch.providerWaiting;
+      msg.providerWaiting = providerWaiting;
+      any = true;
+    }
+    if (patch.streaming !== undefined && patch.streaming !== streaming) {
+      streaming = patch.streaming;
+      msg.streaming = streaming;
+      any = true;
+    }
+    if (patch.toolDelta !== undefined) {
+      const next = Math.max(0, toolCount + patch.toolDelta);
+      if (next !== toolCount) {
+        toolCount = next;
+        msg.toolCount = toolCount;
+        any = true;
+      }
+    }
+    if (patch.clearTransient) {
+      msg.clearTransient = true;
+      any = true;
+    } else if (patch.transient) {
+      msg.transient = patch.transient;
+      any = true;
+    }
+    if (event) msg.event = event;
+    if (any) send(msg);
+    if (debugMode) {
+      send({ type: "debug", event, state: localPreview(), time: Date.now() });
+    }
+  }
+
+  function pushReset(event: string): void {
+    agentActive = false;
+    providerWaiting = false;
+    streaming = false;
+    toolCount = 0;
+    send({
+      type: "state",
+      event,
+      agentActive: false,
+      providerWaiting: false,
+      streaming: false,
+      toolCount: 0,
+    });
+  }
+
+  // Best-effort preview of this session's own state (debug bubble only; the
+  // real visual state is decided by the pet's aggregator).
+  function localPreview(): PetState {
+    if (toolCount > 0) return "working";
+    if (streaming) return "thinking";
+    if (providerWaiting || agentActive) return "waiting";
+    return "idle";
+  }
+
+  function connectPipe(): void {
+    if (connected) return;
+    try {
+      sock = connect(PIPE_PATH);
+    } catch {
+      sock = undefined;
+      scheduleReconnect();
+      return;
+    }
+    sock.on("connect", () => {
+      connected = true;
+      // Resync: push this session's current signals so a fresh/restarted pet
+      // picks up where we are.
+      send({ type: "state", agentActive, providerWaiting, streaming, toolCount });
+    });
+    sock.on("close", () => {
+      connected = false;
+      sock = undefined;
+      scheduleReconnect();
+    });
+    // Swallow socket errors; 'close' already drives reconnect.
+    sock.on("error", () => {});
+  }
+
+  function scheduleReconnect(): void {
+    clearTimeout(reconnectTimer);
+    if (!enabledCached || shutdown) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      startPet();
+      connectPipe();
+    }, 1000);
   }
 
   function killPid(pid: number): void {
@@ -125,18 +218,24 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
   }
 
   function startPet(): void {
-    if (pet) return;
-    // Another session may already own the pet — check PID file
+    if (pet) {
+      connectPipe();
+      return;
+    }
+    // Another session may already own the pet — check the PID file.
     if (existsSync(PID_FILE)) {
       const existingPid = Number(readFileSync(PID_FILE, "utf8").trim());
       if (Number.isFinite(existingPid) && existingPid > 0) {
         try {
           process.kill(existingPid, 0);
-          // Pet already running from another session; use shared file IPC
-          return;
+          connectPipe();
+          return; // pet already running from another session
         } catch {
-          // Stale PID file — clean up and spawn fresh
-          try { rmSync(PID_FILE, { force: true }); } catch {}
+          try {
+            rmSync(PID_FILE, { force: true });
+          } catch {
+            // stale PID file — fall through to spawn
+          }
         }
       }
     }
@@ -157,36 +256,24 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
     pet.on("exit", () => {
       pet = undefined;
     });
-    pet.on("spawn", () => {
-      setTimeout(() => {
-        send({ type: "state", state: visualState });
-        if (debugMode) send({ type: "debug_mode", enabled: true });
-      }, 600);
-    });
-  }
-
-  function resetState(clearFailed = false): void {
-    agentActive = false;
-    providerWaiting = false;
-    streaming = false;
-    activeToolCount = 0;
-    clearTransient(clearFailed);
-    clearTestOverride();
-    pendingState = undefined;
-    if (debounceTimer) {
-      clearTimeout(debounceTimer);
-      debounceTimer = undefined;
-    }
+    pet.on("spawn", () => connectPipe());
   }
 
   function stopPet(): void {
-    resetState(true);
-    visualState = "waving";
-    send({ type: "state", state: "waving" });
-
+    pushReset("pet_off");
+    send({ type: "quit" });
+    connected = false;
+    clearTimeout(reconnectTimer);
+    try {
+      sock?.destroy();
+    } catch {
+      // ignore
+    }
+    sock = undefined;
     const pid = pet?.pid;
     setTimeout(() => {
-      send({ type: "quit" });
+      // quit is the graceful path; kill + PID cleanup is the fallback for a
+      // pet that didn't honor it (or one owned by another session).
       if (pid) killPid(pid);
       killPidFile();
     }, 800);
@@ -217,7 +304,9 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
     } catch {
       // ignore
     }
+    enabledCached = enabled;
   }
+
   function readSourceDir(): string | undefined {
     try {
       if (!existsSync(CONTROL_FILE)) return undefined;
@@ -237,115 +326,7 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
     return Math.min(3, Math.max(0.35, scale));
   }
 
-  function computeTargetState(): PetState {
-    if (testOverride) return testOverride.state;
-    if (transient) return transient.state;
-    if (activeToolCount > 0) return "working";
-    if (streaming) return "thinking";
-    if (providerWaiting || agentActive) return "waiting";
-    return "idle";
-  }
-
-  function setTransient(state: PetState): void {
-    if (transient?.state === "failed" && state !== "failed") return;
-    clearTransient(true);
-    const ms = TRANSIENT_MS[state];
-    if (ms == null) return;
-    transient = {
-      state,
-      timer: setTimeout(() => {
-        transient = undefined;
-        syncVisualState();
-      }, ms),
-    };
-  }
-
-  function clearTransient(clearFailed = false): void {
-    if (!transient) return;
-    if (transient.state === "failed" && !clearFailed) return;
-    clearTimeout(transient.timer);
-    transient = undefined;
-  }
-
-  function clearTestOverride(): void {
-    if (testOverride) {
-      clearTimeout(testOverride.timer);
-      testOverride = undefined;
-    }
-  }
-
-  function syncVisualState(): void {
-    requestVisualState(computeTargetState());
-  }
-
-  function requestVisualState(next: PetState): void {
-    if (next === visualState) {
-      pendingState = undefined;
-      return;
-    }
-    const now = Date.now();
-    if (now >= visualUntil) {
-      applyVisualState(next);
-      return;
-    }
-    pendingState = next;
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(flushPending, visualUntil - now);
-  }
-
-  function flushPending(): void {
-    debounceTimer = undefined;
-    if (pendingState) {
-      applyVisualState(pendingState);
-      return;
-    }
-  }
-
-  function forceVisualState(state: PetState, holdMs: number): void {
-    visualState = state;
-    visualUntil = Date.now() + holdMs;
-    pendingState = undefined;
-    if (debounceTimer) {
-      clearTimeout(debounceTimer);
-      debounceTimer = undefined;
-    }
-    send({ type: "state", state });
-  }
-
-  function applyVisualState(next: PetState): void {
-    visualState = next;
-    visualUntil = Date.now() + MIN_VISUAL_MS[next];
-    pendingState = undefined;
-    if (debounceTimer) {
-      clearTimeout(debounceTimer);
-      debounceTimer = undefined;
-    }
-    send({ type: "state", state: next });
-    pi.logger.debug(`[pet] state ${next}`);
-  }
-
-  function onEvent(event: string, action: EventAction): void {
-    if (!readEnabled()) return;
-
-    if (action.agentActive !== undefined) agentActive = action.agentActive;
-    if (action.providerWaiting !== undefined) providerWaiting = action.providerWaiting;
-    if (action.streaming !== undefined) streaming = action.streaming;
-    if (action.toolDelta !== undefined) {
-      activeToolCount = Math.max(0, activeToolCount + action.toolDelta);
-    }
-    if (action.clearTransient) clearTransient();
-    if (action.transient) setTransient(action.transient);
-
-    const target = computeTargetState();
-    if (debugMode) {
-      send({ type: "debug", event, state: target, time: Date.now() });
-    }
-    pi.logger.debug(
-      `[pet] ${event} -> ${target} | agent=${agentActive} wait=${providerWaiting} stream=${streaming} tools=${activeToolCount} trans=${transient?.state ?? "-"}`,
-    );
-
-    syncVisualState();
-  }
+  enabledCached = readEnabled();
 
   pi.registerCommand("pet", {
     description: "Desktop pet: /pet on | off | size 150 | status | debug | update | test <state>",
@@ -356,7 +337,7 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
       if (cmd === "on") {
         writeEnabled(true);
         startPet();
-        onEvent("pet_on", { transient: "waving" });
+        pushState("pet_on", { transient: "waving" });
         ctx.ui.notify("Desktop pet enabled", "info");
         return;
       }
@@ -379,7 +360,9 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
       }
       if (cmd === "status") {
         ctx.ui.notify(
-          `pet ${readEnabled() ? "on" : "off"} | state=${visualState} | agent=${agentActive} wait=${providerWaiting} stream=${streaming} tools=${activeToolCount} trans=${transient?.state ?? "-"} | debug=${debugMode}`,
+          `pet ${enabledCached ? "on" : "off"} | ` +
+            `agent=${agentActive} wait=${providerWaiting} stream=${streaming} ` +
+            `tools=${toolCount} | debug=${debugMode}`,
           "info",
         );
         return;
@@ -434,21 +417,7 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
           return;
         }
         startPet();
-        clearTestOverride();
-        testOverride = {
-          state,
-          timer: setTimeout(() => {
-            testOverride = undefined;
-            if (debugMode) {
-              send({ type: "debug", event: "test_end", state: computeTargetState(), time: Date.now() });
-            }
-            syncVisualState();
-          }, 2500),
-        };
-        if (debugMode) {
-          send({ type: "debug", event: "test_start", state, time: Date.now() });
-        }
-        forceVisualState(state, 2500);
+        send({ type: "test", state });
         ctx.ui.notify(`Pet test: ${state} (2.5s)`, "info");
         return;
       }
@@ -459,20 +428,30 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
     },
   });
 
+  // --- OMP event wiring → forward as signal deltas ---
+
   pi.on("session_start", () => {
-    if (!readEnabled()) return;
+    enabledCached = readEnabled();
+    if (!enabledCached) return;
     startPet();
-    onEvent("session_start", { transient: "waving" });
+    pushState("session_start", { transient: "waving" });
   });
 
   pi.on("session_shutdown", () => {
-    if (!readEnabled()) return;
-    resetState();
-    syncVisualState();
+    shutdown = true;
+    pushReset("session_shutdown");
+    clearTimeout(reconnectTimer);
+    try {
+      sock?.destroy();
+    } catch {
+      // ignore
+    }
+    sock = undefined;
+    connected = false;
   });
 
   pi.on("agent_start", () =>
-    onEvent("agent_start", {
+    pushState("agent_start", {
       agentActive: true,
       providerWaiting: true,
       streaming: false,
@@ -481,7 +460,7 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
   );
 
   pi.on("before_provider_request", () =>
-    onEvent("provider_wait", {
+    pushState("provider_wait", {
       agentActive: true,
       providerWaiting: true,
       streaming: false,
@@ -498,7 +477,7 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
       streamEvent === "toolcall_start" ||
       streamEvent === "toolcall_delta"
     ) {
-      onEvent(streamEvent, { providerWaiting: false, streaming: true });
+      pushState(streamEvent, { providerWaiting: false, streaming: true });
       return;
     }
     if (
@@ -507,12 +486,12 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
       streamEvent === "toolcall_end" ||
       streamEvent === "done"
     ) {
-      onEvent(streamEvent, { providerWaiting: agentActive, streaming: false });
+      pushState(streamEvent, { providerWaiting: agentActive, streaming: false });
     }
   });
 
   pi.on("tool_execution_start", () =>
-    onEvent("tool_start", {
+    pushState("tool_start", {
       providerWaiting: false,
       streaming: false,
       toolDelta: 1,
@@ -521,41 +500,40 @@ export default function ompPetBridge(pi: ExtensionAPI): void {
   );
 
   pi.on("tool_execution_end", (event) => {
-    const nextAction: EventAction = {
+    const patch: SignalPatch = {
       providerWaiting: agentActive,
       streaming: false,
       toolDelta: -1,
     };
-    if (event.isError) nextAction.transient = "failed";
-    onEvent(event.isError ? "tool_error" : "tool_done", nextAction);
+    if (event.isError) patch.transient = "failed";
+    pushState(event.isError ? "tool_error" : "tool_done", patch);
   });
 
   pi.on("tool_approval_requested", () =>
-    onEvent("approval_req", { providerWaiting: true, streaming: false }),
+    pushState("approval_req", { providerWaiting: true, streaming: false }),
   );
 
   pi.on("tool_approval_resolved", () =>
-    onEvent("approval_done", { providerWaiting: agentActive }),
+    pushState("approval_done", { providerWaiting: agentActive }),
   );
 
   pi.on("auto_compaction_start", () =>
-    onEvent("compact_start", { agentActive: true, providerWaiting: true }),
+    pushState("compact_start", { agentActive: true, providerWaiting: true }),
   );
 
   pi.on("auto_compaction_end", () =>
-    onEvent("compact_end", { agentActive: false, providerWaiting: false, streaming: false }),
+    pushState("compact_end", {
+      agentActive: false,
+      providerWaiting: false,
+      streaming: false,
+    }),
   );
 
-  pi.on("auto_retry_start", () =>
-    onEvent("retry_start", { transient: "failed" }),
-  );
+  pi.on("auto_retry_start", () => pushState("retry_start", { transient: "failed" }));
 
   pi.on("auto_retry_end", () =>
-    onEvent("retry_end", { clearTransient: true, providerWaiting: agentActive }),
+    pushState("retry_end", { clearTransient: true, providerWaiting: agentActive }),
   );
 
-  pi.on("agent_end", () => {
-    resetState();
-    onEvent("agent_end", { agentActive: false, providerWaiting: false, streaming: false });
-  });
+  pi.on("agent_end", () => pushReset("agent_end"));
 }

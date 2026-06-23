@@ -1,22 +1,83 @@
-import { app, BrowserWindow, ipcMain, screen } from 'electron';
-import { existsSync, readFileSync, watchFile, writeFileSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+// Electron main process for the Fuyuko desktop pet.
+//
+// ARCHITECTURE — the pet process is the SINGLE in-memory state authority.
+//   - It listens on a local named pipe. Every OMP session (a separate process
+//     running the omp-pet-bridge extension) connects as a client and pushes
+//     its hook-derived signals as JSON lines.
+//   - The pet keeps one in-memory record per live connection, aggregates all
+//     of them by priority (failed > working > thinking > waiting > waving >
+//     idle), applies the anti-flicker debounce, owns transient timers, and
+//     drives the renderer.
+//   - A closed connection = that session is gone, so its contribution is
+//     dropped automatically. No PID liveness polling, no stale files, no
+//     writes on the hot path.
 
-let win;
-const PID_FILE = resolve(import.meta.dirname, 'pet.pid');
-const SIZE_FILE = resolve(import.meta.dirname, 'pet-size.json');
-const COMMAND_FILE = resolve(import.meta.dirname, 'pet-command.json');
-const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, 'package.json'), 'utf8'));
+import { app, BrowserWindow, ipcMain, screen } from 'electron';
+import { createServer } from 'node:net';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+
+const PET_DIR = import.meta.dirname;
+const PID_FILE = resolve(PET_DIR, 'pet.pid');
+const SIZE_FILE = resolve(PET_DIR, 'pet-size.json');
+const POS_FILE = resolve(PET_DIR, 'pet-position.json');
+// Same path is derived in the extension; both resolve PET_DIR identically.
+const PIPE_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\fuyuko-omp-pet'
+    : join(PET_DIR, 'pet.sock');
+
+const pkg = JSON.parse(readFileSync(resolve(PET_DIR, 'package.json'), 'utf8'));
 const BASE_WIDTH = pkg.pet?.width ?? 230;
 const BASE_HEIGHT = pkg.pet?.height ?? 250;
+
+// Anti-flicker: each state must hold at least this long before another may
+// replace it visually.
+const MIN_VISUAL_MS = {
+  idle: 200,
+  waiting: 500,
+  thinking: 500,
+  working: 500,
+  failed: 900,
+  waving: 600,
+};
+// Transient display windows — owned here, triggered by session signals.
+const TRANSIENT_MS = {
+  failed: 3500,
+  waving: 900,
+};
+
+let win;
 let currentScale = readSavedScale();
 
-// State replay — buffer the latest values so commands received before the
-// renderer is ready are not lost.
+// Renderer replay buffer: commands received before the renderer is ready are
+// flushed on did-finish-load (and again after a renderer crash + reload).
 let rendererReady = false;
 let latestState = 'idle';
 let debugEnabled = false;
 const debugBuffer = [];
+
+// --- per-session in-memory state (one record per pipe connection) ---
+// socket -> { agentActive, providerWaiting, streaming, toolCount, transient, transientTimer }
+const sessions = new Map();
+let testOverride = undefined; // { state, timer }
+
+// --- visual debounce state machine ---
+let visualState = 'idle';
+let visualUntil = 0;
+let pendingState = undefined;
+let debounceTimer = undefined;
+
+function freshSession() {
+  return {
+    agentActive: false,
+    providerWaiting: false,
+    streaming: false,
+    toolCount: 0,
+    transient: null,
+    transientTimer: undefined,
+  };
+}
 
 function readSavedScale() {
   try {
@@ -26,6 +87,30 @@ function readSavedScale() {
   } catch {
     return 1;
   }
+}
+
+function readSavedPos() {
+  try {
+    const d = JSON.parse(readFileSync(POS_FILE, 'utf8'));
+    if (Number.isFinite(d.x) && Number.isFinite(d.y)) return { x: d.x, y: d.y };
+  } catch {
+    // none yet
+  }
+  return null;
+}
+
+let posSaveTimer = undefined;
+function savePos() {
+  if (!win || win.isDestroyed()) return;
+  clearTimeout(posSaveTimer);
+  posSaveTimer = setTimeout(() => {
+    try {
+      const [x, y] = win.getPosition();
+      writeFileSync(POS_FILE, JSON.stringify({ x, y }), 'utf8');
+    } catch {
+      // best-effort
+    }
+  }, 400);
 }
 
 function clampScale(scale, fallback = currentScale) {
@@ -41,54 +126,239 @@ function applyScale(scale) {
   win.webContents.send('omp-size', currentScale);
   try {
     writeFileSync(SIZE_FILE, JSON.stringify({ scale: currentScale }), 'utf8');
-  } catch {}
+  } catch {
+    // best-effort
+  }
 }
 
 ipcMain.on('pet-resize', (_event, scale) => {
   applyScale(scale);
 });
 
-// Forward to renderer only when it's ready; otherwise the value is buffered
-// and replayed on did-finish-load.
 function fwd(channel, ...args) {
   if (!rendererReady || !win || win.isDestroyed()) return;
   win.webContents.send(channel, ...args);
 }
 
-function handleLine(cmd) {
-  if (cmd.type === 'state') {
-    latestState = String(cmd.state || 'idle');
-    fwd('omp-state', latestState);
+// --- aggregation ---
+function aggregateTarget() {
+  if (testOverride) return testOverride.state;
+  let failed = false;
+  let working = false;
+  let thinking = false;
+  let waiting = false;
+  let waving = false;
+  for (const s of sessions.values()) {
+    if (s.transient === 'failed') failed = true;
+    if (s.toolCount > 0) working = true;
+    if (s.streaming) thinking = true;
+    if (s.agentActive || s.providerWaiting) waiting = true;
+    if (s.transient === 'waving') waving = true;
+  }
+  if (failed) return 'failed';
+  if (working) return 'working';
+  if (thinking) return 'thinking';
+  if (waiting) return 'waiting';
+  if (waving) return 'waving';
+  return 'idle';
+}
+
+function syncVisualState() {
+  requestVisualState(aggregateTarget());
+}
+
+function flushPending() {
+  debounceTimer = undefined;
+  if (pendingState) applyVisualState(pendingState);
+}
+
+function requestVisualState(next) {
+  if (next === visualState) {
+    pendingState = undefined;
     return;
   }
-  if (cmd.type === 'quit') {
-    app.quit();
+  const now = Date.now();
+  if (now >= visualUntil) {
+    applyVisualState(next);
     return;
   }
-  if (cmd.type === 'size') {
-    applyScale(cmd.scale);
-    return;
+  pendingState = next;
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(flushPending, visualUntil - now);
+}
+
+function applyVisualState(next) {
+  visualState = next;
+  visualUntil = Date.now() + (MIN_VISUAL_MS[next] ?? 200);
+  pendingState = undefined;
+  clearTimeout(debounceTimer);
+  debounceTimer = undefined;
+  latestState = next;
+  fwd('omp-state', next);
+}
+
+function forceVisualState(state, holdMs) {
+  visualState = state;
+  visualUntil = Date.now() + holdMs;
+  pendingState = undefined;
+  clearTimeout(debounceTimer);
+  debounceTimer = undefined;
+  latestState = state;
+  fwd('omp-state', state);
+}
+
+function applyTestOverride(state) {
+  if (testOverride) clearTimeout(testOverride.timer);
+  testOverride = {
+    state,
+    timer: setTimeout(() => {
+      testOverride = undefined;
+      syncVisualState();
+    }, 2500),
+  };
+  forceVisualState(state, 2500);
+}
+
+// --- per-session transient timers (owned here) ---
+function setSessionTransient(s, state) {
+  // "failed" is sticky: a lesser transient cannot displace it.
+  if (s.transient === 'failed' && state !== 'failed') return;
+  if (s.transient === state) return;
+  clearTimeout(s.transientTimer);
+  const ms = TRANSIENT_MS[state];
+  if (ms == null) return;
+  s.transient = state;
+  s.transientTimer = setTimeout(() => {
+    s.transient = null;
+    s.transientTimer = undefined;
+    syncVisualState();
+  }, ms);
+}
+
+function clearSessionTransient(s, force = false) {
+  if (!s.transient) return;
+  if (s.transient === 'failed' && !force) return;
+  clearTimeout(s.transientTimer);
+  s.transient = null;
+  s.transientTimer = undefined;
+}
+
+// Apply one state message to a session; returns whether anything moved.
+function applyStateMessage(s, msg) {
+  let changed = false;
+  if (msg.agentActive !== undefined && s.agentActive !== msg.agentActive) {
+    s.agentActive = msg.agentActive;
+    changed = true;
   }
-  if (cmd.type === 'debug') {
-    const entry = { event: cmd.event, state: cmd.state, time: cmd.time || Date.now() };
-    debugBuffer.push(entry);
-    if (debugBuffer.length > 20) debugBuffer.shift();
-    fwd('omp-debug', entry);
-    return;
+  if (msg.providerWaiting !== undefined && s.providerWaiting !== msg.providerWaiting) {
+    s.providerWaiting = msg.providerWaiting;
+    changed = true;
   }
-  if (cmd.type === 'debug_mode') {
-    debugEnabled = !!cmd.enabled;
-    fwd('omp-debug-mode', debugEnabled);
-    return;
+  if (msg.streaming !== undefined && s.streaming !== msg.streaming) {
+    s.streaming = msg.streaming;
+    changed = true;
+  }
+  if (msg.toolCount !== undefined && s.toolCount !== msg.toolCount) {
+    s.toolCount = Math.max(0, msg.toolCount);
+    changed = true;
+  }
+  if (msg.clearTransient) {
+    clearSessionTransient(s, true);
+    changed = true;
+  } else if (msg.transient) {
+    setSessionTransient(s, msg.transient);
+    changed = true;
+  }
+  return changed;
+}
+
+// --- control channel (multiplexed on the same pipe) ---
+function handleControl(msg) {
+  switch (msg.type) {
+    case 'size':
+      applyScale(msg.scale);
+      break;
+    case 'debug': {
+      const entry = { event: msg.event, state: msg.state, time: msg.time || Date.now() };
+      debugBuffer.push(entry);
+      if (debugBuffer.length > 20) debugBuffer.shift();
+      fwd('omp-debug', entry);
+      break;
+    }
+    case 'debug_mode':
+      debugEnabled = !!msg.enabled;
+      fwd('omp-debug-mode', debugEnabled);
+      break;
+    case 'test':
+      applyTestOverride(String(msg.state || 'idle'));
+      break;
+    case 'quit':
+      app.quit();
+      break;
+    default:
+      break;
   }
 }
 
+// --- pipe server ---
+function startServer() {
+  const server = createServer((sock) => {
+    sessions.set(sock, freshSession());
+    let buf = '';
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const s = sessions.get(sock);
+        if (!s) continue;
+        if (msg.type === 'state') {
+          const changed = applyStateMessage(s, msg);
+          if (debugEnabled && msg.event) {
+            fwd('omp-debug', { event: msg.event, state: aggregateTarget(), time: Date.now() });
+          }
+          if (changed) syncVisualState();
+        } else {
+          handleControl(msg);
+        }
+      }
+    });
+    sock.on('close', () => {
+      const s = sessions.get(sock);
+      if (s?.transientTimer) clearTimeout(s.transientTimer);
+      sessions.delete(sock);
+      syncVisualState();
+    });
+    // Swallow socket errors; 'close' already handles cleanup.
+    sock.on('error', () => {});
+  });
+
+  if (process.platform !== 'win32') {
+    try {
+      rmSync(PIPE_PATH, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+  server.listen(PIPE_PATH);
+  server.on('error', (err) => console.error('[pet] pipe server error:', err));
+}
+
 function createWindow() {
+  const savedPos = readSavedPos();
   win = new BrowserWindow({
     width: Math.round(BASE_WIDTH * currentScale),
     height: Math.round(BASE_HEIGHT * currentScale),
-    x: pkg.pet?.x,
-    y: pkg.pet?.y,
+    x: savedPos ? savedPos.x : pkg.pet?.x,
+    y: savedPos ? savedPos.y : pkg.pet?.y,
     transparent: true,
     frame: false,
     alwaysOnTop: true,
@@ -103,7 +373,7 @@ function createWindow() {
     },
   });
 
-  if (pkg.pet?.x == null || pkg.pet?.y == null) {
+  if (savedPos == null && (pkg.pet?.x == null || pkg.pet?.y == null)) {
     const { workArea } = screen.getPrimaryDisplay();
     const w = Math.round(BASE_WIDTH * currentScale);
     const h = Math.round(BASE_HEIGHT * currentScale);
@@ -124,38 +394,53 @@ function createWindow() {
     }
   });
 
-  win.on('right-up', () => win.close());
+  // Crash recovery: a dead renderer reloads instead of vanishing silently.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error('[pet] render-process-gone:', details?.reason);
+    setTimeout(() => {
+      try {
+        if (win && !win.isDestroyed()) win.reload();
+      } catch {
+        // ignore
+      }
+    }, 500);
+  });
 
-  // Watch command file (atomic rename by extension => reliable on Windows)
-  function processCommandFile() {
-    let raw;
-    try {
-      raw = readFileSync(COMMAND_FILE, 'utf8');
-    } catch {
-      return;
-    }
-    let cmd;
-    try {
-      cmd = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    handleLine(cmd);
-  }
-
-  watchFile(COMMAND_FILE, { interval: 100 }, () => processCommandFile());
-  processCommandFile();
+  win.on('moved', savePos);
 }
 
 app.whenReady().then(() => {
-  writeFileSync(PID_FILE, String(process.pid), 'utf8');
+  try {
+    writeFileSync(PID_FILE, String(process.pid), 'utf8');
+  } catch {
+    // best-effort
+  }
+  startServer();
   createWindow();
+  syncVisualState();
 });
 
 app.on('before-quit', () => {
   try {
     rmSync(PID_FILE, { force: true });
-  } catch {}
+  } catch {
+    // ignore
+  }
+  if (process.platform !== 'win32') {
+    try {
+      rmSync(PIPE_PATH, { force: true });
+    } catch {
+      // ignore
+    }
+  }
 });
 
 app.on('window-all-closed', () => app.quit());
+
+// Never let an unexpected exception silently kill the pet. Log and survive.
+process.on('uncaughtException', (err) => {
+  console.error('[pet] uncaughtException:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[pet] unhandledRejection:', reason);
+});

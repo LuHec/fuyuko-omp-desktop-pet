@@ -28,3 +28,7 @@ Thumbs.db
 pet.pid
 pet-command.json
 pet-command.tmp.json
+pet-size.json
+pet-position.json
+pet.sock
+sessions/

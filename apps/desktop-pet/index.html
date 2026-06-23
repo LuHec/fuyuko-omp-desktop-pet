@@ -264,8 +264,17 @@
       }
     });
 
-      setState('waving');
-      setTimeout(() => setState('idle'), 1600);
+    let hoverTimer = undefined;
+    function reactAway(state, duration) {
+      clearTimeout(hoverTimer);
+      setState(state);
+      hoverTimer = setTimeout(() => setState('idle'), duration);
+    }
+    pet.addEventListener('mouseenter', () => {
+      reactAway(Math.random() < 0.5 ? 'waving' : 'jumping', 1500);
+    });
+    pet.addEventListener('click', () => {
+      reactAway('waving', 1600);
     });
 
     resizeHandle.addEventListener('pointerdown', (event) => {

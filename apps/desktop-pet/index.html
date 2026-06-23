@@ -265,16 +265,31 @@
     });
 
     let hoverTimer = undefined;
-    function reactAway(state, duration) {
-      clearTimeout(hoverTimer);
+    let isHovering = false;
+    function playHoverCycle() {
+      const state = Math.random() < 0.5 ? 'waving' : 'jumping';
+      const duration = state === 'waving' ? 1600 : 1400;
       setState(state);
-      hoverTimer = setTimeout(() => setState('idle'), duration);
+      hoverTimer = setTimeout(() => {
+        if (isHovering) playHoverCycle();
+        else setState('idle');
+      }, duration);
     }
     pet.addEventListener('mouseenter', () => {
-      reactAway(Math.random() < 0.5 ? 'waving' : 'jumping', 1500);
+      isHovering = true;
+      clearTimeout(hoverTimer);
+      playHoverCycle();
+    });
+    pet.addEventListener('mouseleave', () => {
+      isHovering = false;
+      clearTimeout(hoverTimer);
+      setState('idle');
     });
     pet.addEventListener('click', () => {
-      reactAway('waving', 1600);
+      isHovering = false;
+      clearTimeout(hoverTimer);
+      setState('waving');
+      hoverTimer = setTimeout(() => setState('idle'), 1600);
     });
 
     resizeHandle.addEventListener('pointerdown', (event) => {

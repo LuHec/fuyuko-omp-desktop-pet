@@ -195,8 +195,11 @@
 
     let currentState = 'idle';
     let currentSpriteState = 'idle';
+    let ompState = 'idle';            // 来自 OMP 的真实状态
     let frame = 0;
     let timer = undefined;
+    let hoverTimer = undefined;
+    let isHovering = false;
     let debugVisible = false;
     const MAX_DEBUG = 8;
 
@@ -232,7 +235,11 @@
       schedule();
     }
 
-    ipcRenderer?.on('omp-state', (_event, state) => setState(state));
+    ipcRenderer?.on('omp-state', (_event, state) => {
+      ompState = state;
+      if (!isHovering) setState(state);
+    });
+
     ipcRenderer?.on('omp-size', (_event, scale) => {
       const numeric = Number(scale);
       if (!Number.isFinite(numeric)) return;
@@ -264,18 +271,17 @@
       }
     });
 
-    let hoverTimer = undefined;
-    let isHovering = false;
     function playHoverCycle() {
       const state = Math.random() < 0.5 ? 'waving' : 'jumping';
       const duration = state === 'waving' ? 1600 : 1400;
       setState(state);
       hoverTimer = setTimeout(() => {
         if (isHovering) playHoverCycle();
-        else setState('idle');
+        else setState(ompState);
       }, duration);
     }
     pet.addEventListener('mouseenter', () => {
+      if (isHovering) return;
       isHovering = true;
       clearTimeout(hoverTimer);
       playHoverCycle();
@@ -283,13 +289,13 @@
     pet.addEventListener('mouseleave', () => {
       isHovering = false;
       clearTimeout(hoverTimer);
-      setState('idle');
+      setState(ompState);
     });
     pet.addEventListener('click', () => {
       isHovering = false;
       clearTimeout(hoverTimer);
       setState('waving');
-      hoverTimer = setTimeout(() => setState('idle'), 1600);
+      hoverTimer = setTimeout(() => setState(ompState), 1600);
     });
 
     resizeHandle.addEventListener('pointerdown', (event) => {
